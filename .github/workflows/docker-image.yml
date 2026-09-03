@@ -1,0 +1,107 @@
+name: Docker Image CI
+
+# An allowlist, not an ignore list: a version tag should mean the image changed, and every other
+# path here — the README, this workflow — builds a byte-identical image.
+#
+# The image's whole content is the npm package pinned in the dockerfile, so that is the only input.
+# Use the Actions "Run workflow" button to rebuild when no listed path changed — a base-image CVE,
+# say.
+on:
+  push:
+    branches: ["main"]
+    paths: &image_inputs
+      - "node-red-mcp.dockerfile"
+  pull_request:
+    branches: ["main"]
+    paths: *image_inputs
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the release
+  packages: write # push image to ghcr.io
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Both outputs are computed once and reused, so nothing downstream rebuilds the reference by
+      # hand. GHCR requires a lowercase repository path, and `github.repository` preserves the
+      # owner's casing — metadata-action lowercases it silently, so an image reference assembled
+      # anywhere else has to do the same or it will not match.
+      #
+      # The dockerfile's npm pin is the only place the version lives. Deriving the tag from it is
+      # what stops the image saying one version while containing another.
+      - name: Resolve image name and version
+        id: img
+        run: |
+          echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          version=$(sed -n 's|^RUN npm install -g mcp-node-red@\([0-9][0-9.]*\)$|\1|p' node-red-mcp.dockerfile)
+          test -n "$version" || { echo "no mcp-node-red@<version> found in the dockerfile" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.img.outputs.name }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.img.outputs.version }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: node-red-mcp.dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          load: ${{ github.event_name == 'pull_request' }}
+
+      # A real MCP handshake rather than `--help`, which this server does not implement — it takes
+      # its whole configuration from the environment, so an unrecognised flag would leave a stdio
+      # server waiting on a stdin that never closes.
+      #
+      # Speaking `initialize` over stdin proves both things that can actually break: that the
+      # ENTRYPOINT resolves, and that the server starts. NODE_RED_URL points nowhere on purpose —
+      # nothing is dialled until a tool call, so reaching `serverInfo` needs no Node-RED.
+      #
+      # On a pull request this runs against the locally loaded image; on main it pulls back what was
+      # just pushed, so it also proves the push landed.
+      - name: Smoke test
+        run: |
+          req='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}'
+          out=$(printf '%s\n' "$req" | timeout 60 docker run --rm -i \
+            -e NODE_RED_URL=http://127.0.0.1:1880 \
+            "${{ steps.img.outputs.name }}:${{ steps.img.outputs.version }}" 2>&1 || true)
+          printf '%s\n' "$out" | head -c 2000
+          printf '%s' "$out" | grep -q '"serverInfo"' \
+            || { echo "::error::no initialize response from the server"; exit 1; }
+
+      # After the smoke test, so a release only ever describes an image that started. The tag is the
+      # upstream version rather than one derived from commit history, so a rebuild at an unchanged
+      # pin finds its release already there — skipping is correct, not a failure.
+      - name: Create release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="v${{ steps.img.outputs.version }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists — nothing to do"
+            exit 0
+          fi
+          gh release create "$tag" \
+            --target "$GITHUB_SHA" \
+            --title "$tag" \
+            --notes "Image: \`${{ steps.img.outputs.name }}:${{ steps.img.outputs.version }}\`"
