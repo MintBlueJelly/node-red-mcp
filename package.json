@@ -19,6 +19,6 @@
     "zod": "4.6.5"
   },
   "devDependencies": {
-    "node-red": "5.0.4"
+    "node-red": "5.0.8"
   }
 }
