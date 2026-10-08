@@ -3,7 +3,7 @@
 // the target survive and Node-RED restarts no more than the editor's own deploy would.
 import {
     SUBFLOW_KEYS, TAB_KEYS, assertOnlyContainerChanged, canonical, containerObjects, describeScope, etagOf,
-    indexFlows, insertTab, newId, removeContainer, replaceContainer, restartScope,
+    indexFlows, insertTab, newId, removeContainer, replaceContainer,
 } from './flows.js';
 import { UserError } from './output.js';
 import { compareIssues, installedTypesFrom, validateFlows } from './validate.js';
@@ -13,6 +13,7 @@ const MAX_WARNINGS = 15;
 function normalizeMembers(nodes, containerId, current, index) {
     if (!Array.isArray(nodes)) throw new UserError('nodes must be an array of node objects');
     const old = new Map(current.map((o) => [o.id, o]));
+    const given = new Set();
     return nodes.map((node, i) => {
         if (!node || typeof node !== 'object' || Array.isArray(node)) throw new UserError(`nodes[${i}] is not an object`);
         if (node.credentials !== undefined) {
@@ -23,6 +24,9 @@ function normalizeMembers(nodes, containerId, current, index) {
         const out = { ...node };
         if (out.id === undefined) out.id = newId();
         if (typeof out.id !== 'string' || !out.id) throw new UserError(`nodes[${i}] has an invalid id`);
+        // Two entries with one id would leave only one in place, and the other would vanish silently.
+        if (given.has(out.id)) throw new UserError(`id ${out.id} appears more than once in nodes`);
+        given.add(out.id);
         if (out.z === undefined) out.z = containerId;
         if (out.z !== containerId) throw new UserError(`node ${out.id} has z "${out.z}", but it belongs to ${containerId}`);
         const elsewhere = index.byId.get(out.id);
@@ -40,10 +44,6 @@ function normalizeMembers(nodes, containerId, current, index) {
 function pickKeys(input, allowed, what) {
     const extra = Object.keys(input).filter((k) => !allowed.includes(k));
     if (extra.length) throw new UserError(`${what} cannot change ${extra.join(', ')}; allowed: ${allowed.join(', ')}`);
-    // A `cred` value written here would land in the flow file in plain text, not in the encrypted
-    // credentials, which only the editor can write.
-    const secret = Array.isArray(input.env) && input.env.find((e) => e?.type === 'cred' && e.value);
-    if (secret) throw new UserError(`env ${secret.name} is a credential; leave its value empty and set it in the editor`);
     return input;
 }
 
@@ -157,12 +157,12 @@ export async function check(client, flows, plan) {
     const types = installedTypesFrom(await client.getNodes());
     const issues = compareIssues(validateFlows(flows, types), validateFlows(plan.next, types));
     const relevant = issues.warnings.filter((w) => !w.preexisting || plan.touched.has(w.id));
-    const scope = restartScope(flows, plan.next);
+    const scope = describeScope(flows, plan.next);
     return {
         errors: issues.errors,
         warnings: relevant.slice(0, MAX_WARNINGS),
         moreWarnings: relevant.length > MAX_WARNINGS ? relevant.length - MAX_WARNINGS : undefined,
-        scope: describeScope(plan.next, scope),
+        scope,
         fullRestart: scope.fullRestart,
     };
 }
@@ -181,7 +181,9 @@ export function createWriter({ client, log = () => {} }) {
         if (plan.gone) return { done: { result: 'already_deleted', flow: plan.target } };
         if (plan.unchanged) return { done: { result: 'no_op', flow: plan.target, etag: plan.currentEtag } };
         if (etag !== undefined && plan.currentEtag !== etag) {
-            throw new UserError('the flow changed since you read it; call get_flow again and apply your change to what it returns', { currentEtag: plan.currentEtag });
+            // No current etag in the refusal: a client would resend its stale nodes with it and delete
+            // what the other person added.
+            throw new UserError('the flow changed since you read it; call get_flow again and apply your change to what it returns');
         }
         assertOnlyContainerChanged(flows, plan.next, plan.touched);
         const checked = await check(client, flows, plan);

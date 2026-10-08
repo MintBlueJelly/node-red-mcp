@@ -6,7 +6,7 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { fixtureFlows } from './fixture.js';
+import { COUNTERS, fixtureFlows } from './fixture.js';
 
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const NODE_RED = join(ROOT, 'node_modules', 'node-red', 'red.js');
@@ -78,22 +78,38 @@ export async function startNodeRed() {
         await nr.start();
     };
     nr.signal = (sig) => nr.proc.kill(sig);
-    nr.seed = async () => {
-        const res = await nr.api('POST', '/flows', { flows: fixtureFlows() }, { 'Node-RED-Deployment-Type': 'full' });
+    nr.seed = async (flows = fixtureFlows(), keys = COUNTERS) => {
+        const res = await nr.api('POST', '/flows', { flows }, { 'Node-RED-Deployment-Type': 'full' });
         if (res.status !== 200) throw new Error(`seeding failed: ${res.status} ${JSON.stringify(res.body)}`);
-        await waitFor(async () => (await nr.counters()).A_alone === 1, { what: 'flows to start' });
+        await waitFor(async () => Object.values(await nr.counters(keys)).some((v) => v === 1), { what: 'flows to start' });
+        await sleep(500);
     };
     nr.context = async (key) => {
         const res = await nr.api('GET', `/context/global/${encodeURIComponent(key)}`);
         return res.body?.msg;
     };
-    nr.counters = async () => {
+    nr.counters = async (keys = COUNTERS) => {
         const out = {};
-        for (const k of ['A_alone', 'A_chain', 'B_alone', 'B_chain', 'C_alone', 'E_alone', 'SF1']) {
+        for (const k of keys) {
             const v = await nr.context(`start_${k}`);
             out[k] = v === undefined || v === '(undefined)' ? 0 : Number(v);
         }
         return out;
+    };
+    /**
+     * Runs `action` and returns its result and the On Start counters that moved. After a deploy it
+     * waits for Node-RED to log that the flows started, so a restart that comes late is still seen.
+     */
+    nr.restartedBy = async (action, keys = COUNTERS) => {
+        const before = await nr.counters(keys);
+        const from = nr.logs.length;
+        const result = await action();
+        if (result?.result === 'deployed' || result?.result === 'deleted') {
+            await waitFor(() => nr.logs.slice(from).some((l) => /Started (modified )?flows/.test(l)), { what: 'Node-RED to start the flows' });
+        }
+        await sleep(200);
+        const after = await nr.counters(keys);
+        return { result, moved: Object.keys(after).filter((k) => after[k] !== before[k]).sort() };
     };
     nr.cleanup = async () => {
         await nr.stop();

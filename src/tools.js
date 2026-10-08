@@ -39,7 +39,7 @@ export function defineTools() {
             description: 'Get one Node-RED flow (tab) or subflow with all its nodes, or one global config node, plus the etag that update_flow, delete_flow and update_global require. Pass "global" for an index of global config nodes and subflows.',
             annotations: READ,
             input: { id: z.string().describe('A flow, subflow or config node id from list_flows, or "global"') },
-            async handler({ id }, { client }) {
+            async handler({ id }, { client, config }) {
                 const { flows } = await client.getFlows();
                 const index = indexFlows(flows);
                 if (id === 'global') {
@@ -52,8 +52,15 @@ export function defineTools() {
                 if (!objects) throw new UserError(`no flow, subflow or config node with id ${id}; list_flows shows the ids`);
                 const [head, ...nodes] = objects;
                 if (head.z) throw new UserError(`${id} is a ${head.type} in flow ${head.z}; get that flow instead`);
-                if (head.type === 'tab' || head.type === 'subflow') return { flow: head, nodes, etag: etagOf(objects) };
-                return { node: head, etag: etagOf(objects) };
+                if (head.type !== 'tab' && head.type !== 'subflow') return { etag: etagOf(objects), node: head };
+                const result = { etag: etagOf(objects), flow: head, nodes };
+                // A truncated flow cannot be written back, so it is refused whole, and without its etag:
+                // a write from a partial node list would delete every node left out.
+                const size = JSON.stringify(result).length;
+                if (size > config.resultMaxChars - 200) {
+                    throw new UserError(`flow ${id} is too large to return at once (${size} characters, ${nodes.length} nodes); find what you need with search_nodes and change this flow in the editor`);
+                }
+                return result;
             },
         },
         {
@@ -74,7 +81,7 @@ export function defineTools() {
         },
         {
             name: 'get_node_status',
-            description: 'Current status of Node-RED nodes — the coloured dot and text the editor shows under a node (e.g. "connected", "ENOTFOUND"). Filter by flow or node, or only red and yellow ones. Statuses replayed at connect are marked retained, ones older than the last deploy beforeLastDeploy, and leftovers from deleted nodes or disabled flows stale — only_problems leaves those out.',
+            description: 'Current status of Node-RED nodes — the coloured dot and text the editor shows under a node (e.g. "connected", "ENOTFOUND"). Filter by flow or node, or only red and yellow ones. Statuses replayed at connect, or set within a second of it, are marked retained; ones older than the last deploy beforeLastDeploy; and leftovers from deleted nodes or disabled flows stale — only_problems leaves those out.',
             annotations: READ,
             input: {
                 flow_id: z.string().optional(),
@@ -88,7 +95,7 @@ export function defineTools() {
                 for (const [id, s] of comms.statuses) {
                     const r = resolveStatus(index, id);
                     if (flowId && r.tab !== flowId) continue;
-                    if (nodeId && id !== nodeId && r.node?.id !== nodeId && r.instance !== nodeId) continue;
+                    if (nodeId && id !== nodeId && r.node?.id !== nodeId && !r.instance?.split('/').includes(nodeId)) continue;
                     if (onlyProblems && (!isProblem(s) || r.stale)) continue;
                     statuses.push({
                         id,
@@ -178,6 +185,7 @@ export function defineTools() {
                 for (const set of await client.getNodes()) {
                     const m = modules.get(set.module) ?? { module: set.module, version: set.version, types: [] };
                     if (set.enabled === false) m.disabledSets = [...(m.disabledSets ?? []), set.name];
+                    else if (set.err) m.failedSets = [...(m.failedSets ?? []), { name: set.name, error: String(set.err).slice(0, 200) }];
                     else m.types.push(...(set.types ?? []));
                     modules.set(set.module, m);
                 }
@@ -200,7 +208,7 @@ export function defineTools() {
         },
         {
             name: 'validate_flow',
-            description: 'Check a Node-RED flow change without deploying it: the same checks update_flow and create_flow run (ids, wiring, groups, link nodes, installed node types), plus which flows would restart. Pass flow_id to check an update, omit it to check a new flow.',
+            description: 'Check a Node-RED flow change without deploying it: the same checks update_flow and create_flow run (ids, wiring, groups, link nodes, cycles, installed node types; no npm modules or exec nodes), plus where nodes would restart. Pass flow_id to check an update, omit it to check a new flow.',
             annotations: READ,
             input: {
                 flow_id: z.string().optional(),
@@ -229,7 +237,7 @@ export function defineTools() {
         },
         {
             name: 'update_flow',
-            description: 'Change one Node-RED flow (tab) and deploy it, restarting only the changed nodes and those wired to them. Needs the etag from get_flow; refused if the flow changed since, or is locked in the editor. Send nodes as the complete list. Only label, info, disabled, env and nodes can change.',
+            description: 'Change one Node-RED flow (tab) and deploy it as a modified-flows deploy; the result lists every flow where Node-RED restarts nodes, which can include other tabs reached through link or config nodes. Needs the etag from get_flow; refused if the flow changed since, or is locked in the editor. Send nodes as the complete list. Only label, info, disabled, env and nodes can change.',
             annotations: { ...WRITE, idempotentHint: true },
             input: { id: z.string(), etag: z.string().describe('From get_flow'), flow: z.strictObject({ ...tabFields, nodes: nodeList.optional() }) },
             handler: ({ id, etag, flow }, { write }) => write((flows) => plans.updateTab(flows, { id, flow }), { etag }),
@@ -243,7 +251,7 @@ export function defineTools() {
         },
         {
             name: 'update_global',
-            description: 'Change one Node-RED subflow (its definition and/or its nodes) or one global config node, and deploy. Every flow that uses it restarts the affected nodes. Needs the etag from get_flow. The global-config node (global environment) cannot be changed here.',
+            description: 'Change one Node-RED subflow (its definition and/or its nodes) or one global config node, and deploy. Every flow that uses it, directly or through nested subflows and config nodes, restarts the affected nodes; the result lists them. Needs the etag from get_flow. The global-config node (global environment) cannot be changed here.',
             annotations: { ...WRITE, idempotentHint: true },
             input: {
                 id: z.string().describe('Subflow or global config node id'),
@@ -266,18 +274,32 @@ export function defineTools() {
         },
         {
             name: 'trigger_inject',
-            description: 'Press the button of one Node-RED inject node, sending its configured message into the flow — this runs real automation. The same node is refused again within a short cooldown unless repeat is true. Follow with get_debug_messages to see what happened.',
-            annotations: { ...WRITE, destructiveHint: false },
-            input: { node_id: z.string(), repeat: z.boolean().default(false).describe('Allow a repeat inside the cooldown') },
+            description: 'Press the button of one Node-RED inject node, sending its configured message into the flow — this runs real automation. Any other node is refused. The same node is refused again within a short cooldown unless repeat is true. Follow with get_debug_messages to see what happened.',
+            annotations: WRITE,
+            input: { node_id: z.string().describe('An inject node id; inside a subflow instance, <instance>-<node>'), repeat: z.boolean().default(false).describe('Allow a repeat inside the cooldown') },
             async handler({ node_id: nodeId, repeat }, { client, ring, injects, config }) {
+                // Node-RED's endpoint sends a message into whatever node the id names, so the type is
+                // checked here.
+                const { flows } = await client.getFlows();
+                const r = resolveStatus(indexFlows(flows), nodeId);
+                if (r.node?.type !== 'inject' || r.template) {
+                    const what = r.template ? 'the definition inside a subflow; use <instance>-<node>' : r.node ? `a ${r.node.type}` : 'no known node';
+                    throw new UserError(`${nodeId} is ${what}, not an inject node`);
+                }
                 const last = injects.get(nodeId);
                 const now = Date.now();
                 if (!repeat && last && now - last < config.injectCooldownMs) {
                     throw new UserError(`node ${nodeId} was triggered ${Math.round((now - last) / 1000)} s ago; pass repeat: true to trigger it again`);
                 }
-                const cursor = ring.read({ limit: 1 }).cursor;
-                await client.inject(nodeId);
+                // Set before the next await, so two calls at once cannot both pass the check.
                 injects.set(nodeId, now);
+                const cursor = ring.read({ limit: 1 }).cursor;
+                try {
+                    await client.inject(nodeId);
+                } catch (err) {
+                    injects.delete(nodeId);
+                    throw err;
+                }
                 return { node: nodeId, triggered: true, cursor };
             },
         },

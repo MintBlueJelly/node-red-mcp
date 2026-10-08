@@ -42,12 +42,48 @@ export function validateFlows(flows, installedTypes) {
         if (obj.credentials !== undefined) {
             add('error', 'credentials', obj.id, `${obj.id} carries credentials; set them in the editor, never through this server`);
         }
+        // Node-RED stores a `cred` value given here in the flow file, in plain text, and uses it.
+        const secret = Array.isArray(obj.env) && obj.env.find((e) => e?.type === 'cred' && e.value);
+        if (secret) add('error', 'cred-env', obj.id, `${obj.id}: env ${secret.name} is a credential; leave its value empty and set it in the editor`);
+        checkCode(obj, add);
         checkWires(obj, index, add);
         checkGroup(obj, index, add);
         checkLinks(obj, index, add);
         if (obj.type === 'subflow') checkSubflowPorts(obj, index, add);
     }
+    checkSubflowCycles(index, add);
     return issues;
+}
+
+// `libs` makes Node-RED run `npm install` on deploy, and a failed install leaves the stopped nodes
+// stopped. `exec` runs shell commands in the Node-RED process. Existing ones stay editable, because
+// only problems a change introduces block it, and the module list is part of the message.
+function checkCode(obj, add) {
+    if (obj.type === 'function' && Array.isArray(obj.libs)) {
+        const modules = obj.libs.map((l) => (typeof l === 'string' ? l : l?.module)).filter(Boolean).sort();
+        if (modules.length) add('error', 'external-modules', obj.id, `${obj.id} needs npm modules ${modules.join(', ')}; Node-RED would install them on deploy. Add them in the editor.`);
+    }
+    if (obj.type === 'exec') add('error', 'exec', obj.id, `${obj.id} is an exec node, which runs shell commands; add it in the editor`);
+}
+
+// A subflow that contains itself, directly or through others, hangs Node-RED when it is instantiated.
+function checkSubflowCycles(index, add) {
+    const uses = (id) => index.membersOf(id).filter((n) => n.type?.startsWith('subflow:')).map((n) => n.type.slice(8));
+    for (const sf of index.subflows) {
+        const stack = uses(sf.id);
+        const seen = new Set();
+        while (stack.length) {
+            const id = stack.pop();
+            if (id === sf.id) {
+                add('error', 'subflow-cycle', sf.id, `subflow ${sf.id} contains itself`);
+                break;
+            }
+            if (!seen.has(id)) {
+                seen.add(id);
+                stack.push(...uses(id));
+            }
+        }
+    }
 }
 
 function checkWires(obj, index, add) {
@@ -72,6 +108,18 @@ function checkGroup(obj, index, add) {
         for (const id of obj.nodes) {
             const m = index.byId.get(id);
             if (!m || m.z !== obj.z) add('error', 'group-member-missing', obj.id, `group ${obj.id} lists ${id}, which is not in the same flow`);
+        }
+    }
+    // Node-RED starts a group only after its parent, and requeues it forever on a cycle, blocking the
+    // event loop: the runtime stops answering, and does so again after every restart.
+    if (obj.type === 'group') {
+        const seen = new Set([obj.id]);
+        for (let g = obj.g; g !== undefined && g !== ''; g = index.byId.get(g)?.g) {
+            if (seen.has(g)) {
+                add('error', 'group-cycle', obj.id, `group ${obj.id} is nested in itself`);
+                return;
+            }
+            seen.add(g);
         }
     }
 }
@@ -112,7 +160,8 @@ export function compareIssues(before, after) {
 export function installedTypesFrom(nodeSets) {
     const types = new Set();
     for (const set of nodeSets ?? []) {
-        if (set.enabled === false) continue;
+        // A set that failed to load is listed enabled, with `err`, but registers no types.
+        if (set.enabled === false || set.err) continue;
         for (const t of set.types ?? []) types.add(t);
     }
     return types;

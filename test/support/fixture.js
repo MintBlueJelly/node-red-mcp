@@ -12,7 +12,7 @@ const counter = (name) => ({
     outputs: 1,
 });
 
-export const INSTALLED_TYPES = ['comment', 'debug', 'function', 'global-config', 'http proxy', 'http request', 'inject',
+export const INSTALLED_TYPES = ['comment', 'debug', 'exec', 'function', 'global-config', 'http proxy', 'http request', 'inject',
     'junction', 'link call', 'link in', 'link out'];
 
 export function fixtureFlows() {

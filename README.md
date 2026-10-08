@@ -20,7 +20,7 @@ because that package could not read a single flow and had no access to status or
 | `get_context` | reads global, flow or node context |
 | `get_debug_messages` | debug output, warnings, errors and runtime events since a cursor |
 | `get_diagnostics` | Node-RED's diagnostics report |
-| `get_flow` | one tab, subflow or config node with its etag; `global` lists config nodes and subflows |
+| `get_flow` | one tab, subflow or config node with its etag; `global` lists config nodes and subflows; refuses a tab too large to return whole |
 | `get_flow_state` | whether flows run, the last runtime state event and deploy |
 | `get_node_status` | the status each node shows in the editor |
 | `get_nodes` | installed node types by module |
@@ -28,7 +28,7 @@ because that package could not read a single flow and had no access to status or
 | `list_flows` | tabs and subflows with counts and how many nodes show a problem |
 | `search_nodes` | finds nodes by text, type or flow, returning where they are |
 | `set_debug_state` | switches a debug node on or off until its next restart |
-| `trigger_inject` | presses an inject node's button, with a cooldown |
+| `trigger_inject` | presses an inject node's button, with a cooldown; refuses any other node |
 | `update_flow` | changes one tab; needs the etag |
 | `update_global` | changes one subflow or global config node; needs the etag |
 | `validate_flow` | runs a write's checks and reports what would restart, without deploying |
@@ -37,13 +37,19 @@ because that package could not read a single flow and had no access to status or
 stopping the runtime, deleting context, writing credentials, and full deploys. A deployment can
 rely on their absence; it does not have to filter them out.
 
+**Refused in a flow write:** a function node's `libs`, because Node-RED runs `npm install` for
+them on deploy, and `exec` nodes, which run shell commands. Ones that already exist stay editable.
+
+**Not bounded:** a flow write is still code that runs in the Node-RED process, through function
+nodes. Whoever may write flows through this server may run JavaScript there.
+
 ## Configuration
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `NODE_RED_URL` | required | e.g. `http://nodered:1880`; `/comms` is derived from it |
 | `NODE_RED_TOKEN` | none | Admin API bearer token, also sent to `/comms`, where `adminAuth` is on |
-| `PORT`, `HOST` | `8080`, `0.0.0.0` | where MCP is served |
+| `PORT`, `HOST` | `8080`, `0.0.0.0` | where MCP is served; `MCP_PORT` and `MCP_HOST`, as some MCP hosts set them, apply when these are unset |
 | `NODE_RED_TIMEOUT_MS` | `30000` | per Admin API request |
 | `COMMS_HEARTBEAT_TIMEOUT_MS` | `45000` | silence on `/comms` before it reconnects; Node-RED beats every 15 s |
 | `DEBUG_BUFFER_ITEMS`, `DEBUG_BUFFER_BYTES` | `1000`, 4 MiB | bounds of the debug buffer |
@@ -65,27 +71,37 @@ check, so it overwrites whatever someone deployed in between.
 Before deploying, the server checks:
 
 - that nothing outside the target changed;
-- the caller's etag, so a flow someone edited since it was read is refused rather than overwritten;
-- the validator: ids unique across all flows, wires, groups, links, subflow ports, and installed
-  node types only. A type that is not installed would leave Node-RED "waiting for missing types".
-  Only problems the change introduces are refused; existing ones are reported as warnings.
+- the caller's etag, so a flow someone edited since it was read is refused rather than overwritten.
+  The refusal carries no etag: a client would resend its stale node list with it;
+- the validator: ids unique across all flows, wires, groups, links, subflow ports, installed node
+  types only, no group nested in itself, no subflow containing itself, no `libs`, no `exec` and no
+  `cred` env value written in plain text. A type that is not installed leaves Node-RED "waiting
+  for missing types"; a group or subflow cycle hangs it. Only problems the change introduces are
+  refused; existing ones are reported as warnings.
 
 A 409 from Node-RED is retried once, and only if the etag still matches. Writes run one at a time.
 
 ### What restarts
 
-A modified-flows deploy restarts the changed nodes and everything wired to them, transitively. It
-also restarts:
+Every write result lists each flow where Node-RED stops or starts nodes, and how many; global config
+nodes appear as `global`. `validate_flow` shows the same before a write.
 
-- the users of a changed config node and the instances of a changed subflow, with their wired
-  neighbours;
-- every node of a tab whose `env` or `disabled` changed.
+- **How it is computed.** `src/diff.js` follows Node-RED's own `diffConfigs` step by step, then
+  applies it the way `stop` and `start` do.
+- **How that is proven.** `test/unit/diff.test.js` loads Node-RED's `diffConfigs` from the pinned
+  devDependency and requires the same answer for every generated change to two fixtures.
+- **What is measured.** `test/integration/scope.test.js` checks with On Start counters that the
+  reported flows are the ones that restart. It covers a config node used by another config node,
+  nested subflows, a config node used inside a subflow template, and link nodes across tabs.
 
-Layout, a tab's label and its description restart nothing. A `global-config` change restarts
-everything, so `update_global` refuses it. Every write result lists the tabs that restart, and
-`validate_flow` shows the same in advance. `test/integration/writes.test.js` measures each of these
-against the real runtime with On Start counters. `src/flows.js` mirrors `diffConfigs` and `stop` in
-`@node-red/runtime`.
+What that means in practice:
+
+- A change restarts the changed nodes and everything wired to them, transitively.
+- Through a config node, a subflow or a single-target link, it also reaches other flows; through a
+  group, the group's other members.
+- A tab whose `env` or `disabled` changes restarts whole.
+- Layout, a tab's label and its description restart nothing.
+- A `global-config` change restarts everything, so `update_global` refuses it.
 
 ### Clients repeat writes
 
@@ -104,14 +120,16 @@ tests check that credentials survive updates and a restart.
 
 A long-lived WebSocket subscribes to `status/#`, `debug` and `notification/#`.
 
-- **Statuses.** Node-RED replays the current statuses on subscribe without a time, so they are
-  marked `retained`. A status older than the last deploy is marked `beforeLastDeploy`.
+- **Statuses.** Node-RED replays the current statuses on subscribe without a time, so the first
+  status for a node within a second of connecting is marked `retained`; one that really changed
+  in that second looks the same. A status older than the last deploy is marked `beforeLastDeploy`.
 - **Leftovers.** Node-RED can go on replaying the last status of a deleted node, or of a node in a
-  disabled flow that set it while stopping. Those are marked `stale`, and neither `only_problems`
-  nor the `problems` count of `list_flows` includes them. That count does include nodes inside
-  subflow instances on the tab.
-- **Subflow instances.** Nodes inside a subflow instance report as `<instance>-<node>` and are
-  attributed to the instance's tab.
+  disabled flow that set it while stopping. A status under the own id of a node in a subflow
+  definition is one too, because that node never runs as itself. All are marked `stale`, and
+  neither `only_problems` nor the `problems` count of `list_flows` includes them.
+- **Subflow instances.** A node inside a subflow instance reports as `<instance>-<node>`, and
+  inside nested instances as `<outer>-<inner>-<node>`. It is attributed to the outer instance's
+  tab, and counts as a problem there.
 - **Debug output** goes into a ring bounded by count and bytes, because Node-RED publishes it
   without a rate limit. Reads take a `<boot>:<seq>` cursor, so a client sees only what arrived
   after its last read. The cursor also tells it when the server restarted (`reset`) or entries were
@@ -121,7 +139,8 @@ A long-lived WebSocket subscribes to `status/#`, `debug` and `notification/#`.
 The buffer lives in the process: **run one replica**, and expect it to be empty after a restart.
 
 Whoever can call this server can read debug output and context, which may hold process data. That
-is the same exposure as the editor.
+is the same exposure as the editor's, with one difference: the buffer keeps history from before a
+caller arrived, and every caller shares it.
 
 ### Stateless HTTP
 
@@ -138,11 +157,17 @@ npm test                    # unit tests, no Node-RED needed
 npm run test:integration    # spawns the Node-RED pinned in devDependencies
 ```
 
-The `node-red` devDependency is the runtime the integration tests prove the design against. Keep
-it at the version you deploy, and bump it together with the deployed runtime.
+The `node-red` devDependency is the runtime the tests prove the design against, the differential
+test included. Keep it at the version you deploy, and bump it together with the deployed runtime;
+Dependabot leaves it alone for that reason.
 
 ## Releasing
 
-**`version` in `package.json` is the release.** Every push to `main` runs the tests. An image is
-published only for a version without a GitHub release, so a tag never moves: bump the version to
-ship. The release notes carry the image digest.
+**`version` in `package.json` is the release.** Every push and pull request runs the tests, with
+read-only permissions. Only `main` publishes, and only a version that has no GitHub release and no
+image yet, so a tag never moves: bump the version to ship. The release notes carry the image digest.
+
+## Licence
+
+MIT. `src/diff.js` follows the algorithm of `diffConfigs` and `diffNodes` in Node-RED's
+`@node-red/runtime`, which is licensed under the Apache License 2.0.

@@ -1,6 +1,7 @@
 // Pure functions over Node-RED's flat flow array (`GET /flows`, API v2). Nothing here talks to
 // Node-RED, so everything a write does to the array can be tested without a runtime.
 import { createHash, randomBytes } from 'node:crypto';
+import { deployScope } from './diff.js';
 
 export const CONTAINER_TYPES = new Set(['tab', 'subflow']);
 
@@ -76,27 +77,45 @@ function firstLine(text, max = 120) {
 }
 
 /**
- * Resolves a status id to its node and tab, including the `<instance>-<node>` ids of nodes inside a
- * subflow instance. `stale` marks what Node-RED still replays but no running node can have set: the
- * status of a deleted node, or of a node in a disabled tab.
+ * Resolves a status id to its node and tab. A node inside a subflow instance runs as
+ * `<instance>-<node>`, and inside nested instances as `<outer>-<inner>-<node>`; `instance` is then
+ * the chain of instance ids, outermost first, joined by `/`. `stale` marks what Node-RED still
+ * replays but no running node can have set: the status of a deleted node, of a node in a disabled
+ * tab, or under the own id of a node in a subflow definition, which never runs as itself.
  */
 export function resolveStatus(index, id) {
-    let node = index.byId.get(id);
-    let tab = node?.z;
-    let instance;
-    if (!node) {
-        for (let i = id.indexOf('-'); i > 0; i = id.indexOf('-', i + 1)) {
-            const candidate = index.byId.get(id.slice(0, i));
-            if (candidate?.type?.startsWith('subflow:')) {
-                instance = candidate.id;
-                tab = candidate.z;
-                node = index.byId.get(id.slice(i + 1));
-                break;
+    const direct = index.byId.get(id);
+    if (direct) {
+        const container = direct.z ? index.byId.get(direct.z) : undefined;
+        const template = container?.type === 'subflow';
+        const flowDisabled = container?.type === 'tab' && Boolean(container.disabled);
+        return { node: direct, tab: direct.z, instance: undefined, unknownNode: false, template, flowDisabled, stale: template || flowDisabled };
+    }
+    const chain = [];
+    let rest = id;
+    let scope = null;
+    let node;
+    search: for (;;) {
+        for (let i = rest.indexOf('-'); i > 0; i = rest.indexOf('-', i + 1)) {
+            const candidate = index.byId.get(rest.slice(0, i));
+            const inScope = scope === null ? index.byId.get(candidate?.z)?.type === 'tab' : candidate?.z === scope;
+            if (candidate?.type?.startsWith('subflow:') && inScope) {
+                chain.push(candidate.id);
+                scope = candidate.type.slice(8);
+                rest = rest.slice(i + 1);
+                const inner = index.byId.get(rest);
+                if (inner?.z === scope) {
+                    node = inner;
+                    break search;
+                }
+                continue search;
             }
         }
+        break;
     }
-    const container = tab ? index.byId.get(tab) : undefined;
-    return { node, tab, instance, unknownNode: !node, flowDisabled: Boolean(container?.disabled), stale: !node || Boolean(container?.disabled) };
+    const tab = chain.length ? index.byId.get(chain[0]).z : undefined;
+    const flowDisabled = Boolean(tab && index.byId.get(tab)?.disabled);
+    return { node, tab, instance: chain.length ? chain.join('/') : undefined, unknownNode: !node, template: false, flowDisabled, stale: !node || flowDisabled };
 }
 
 export const isProblem = (status) => ['red', 'yellow'].includes(status?.fill);
@@ -223,104 +242,16 @@ export function assertOnlyContainerChanged(before, after, allowedIds) {
 }
 
 /**
- * What Node-RED 5 restarts for a `flows`-type deploy, mirroring `diffConfigs` and `stop` in
- * `@node-red/runtime/lib/flows`: changed, added, removed and rewired nodes, the nodes that use a
- * changed config node, the instances of a changed subflow, the members of a changed group, every
- * node of a tab whose `env` or `disabled` changed — and then everything transitively wired to any of
- * them. A changed `global-config` node restarts everything.
+ * What a write restarts, per flow, in tab order with the global config nodes last. The scope comes
+ * from `deployScope`, which follows Node-RED's own diff; see `src/diff.js`.
  */
-export function restartScope(before, after) {
-    const oldById = new Map(before.map((o) => [o.id, o]));
-    const newById = new Map(after.map((o) => [o.id, o]));
-    const restarting = new Set();
-    const changed = new Set();
-    let fullRestart = false;
-
-    for (const [id, obj] of newById) {
-        const old = oldById.get(id);
-        if (obj.type === 'tab') {
-            if (!old || Boolean(old.disabled) !== Boolean(obj.disabled) || canonical(old.env) !== canonical(obj.env)) {
-                for (const m of after) if (m.z === id) restarting.add(m.id);
-            }
-            continue;
-        }
-        if (!old || nodeChanged(old, obj) || canonical(old.wires) !== canonical(obj.wires)) changed.add(id);
-        if (obj.type === 'global-config' && old && nodeChanged(old, obj)) fullRestart = true;
-    }
-    for (const [id, old] of oldById) if (!newById.has(id) && old.type !== 'tab') changed.add(id);
-
-    const changedSubflows = new Set();
-    for (const id of changed) {
-        const obj = newById.get(id) ?? oldById.get(id);
-        if (obj.type === 'subflow') changedSubflows.add(id);
-        const parent = obj.z && (newById.get(obj.z) ?? oldById.get(obj.z));
-        if (parent?.type === 'subflow') changedSubflows.add(parent.id);
-    }
-    for (const obj of after) {
-        if (CONTAINER_TYPES.has(obj.type)) continue;
-        const inTab = obj.z && newById.get(obj.z)?.type === 'tab';
-        if (changed.has(obj.id) && (inTab || !obj.z)) restarting.add(obj.id);
-        if (obj.type.startsWith('subflow:') && changedSubflows.has(obj.type.slice(8))) restarting.add(obj.id);
-        if (references(obj, changed)) restarting.add(obj.id);
-        if (obj.type === 'group' && changed.has(obj.id)) for (const m of obj.nodes ?? []) restarting.add(m);
-    }
-
-    const links = wireGraph(before, after);
-    const queue = [...restarting, ...[...changed].filter((id) => !newById.has(id))];
-    while (queue.length) {
-        const id = queue.pop();
-        for (const next of links.get(id) ?? []) {
-            if (!restarting.has(next)) {
-                restarting.add(next);
-                queue.push(next);
-            }
-        }
-    }
-    return { fullRestart, nodes: [...restarting].filter((id) => newById.has(id)) };
-}
-
-// `diffNodes`: layout and wiring are not a change of the node itself; a group's membership, style
-// and size are not either.
-function nodeChanged(old, obj) {
-    const ignore = obj.type === 'group' ? new Set(['x', 'y', 'wires', 'nodes', 'style', 'w', 'h']) : new Set(['x', 'y', 'wires']);
-    const strip = (o) => Object.fromEntries(Object.entries(o).filter(([k]) => !ignore.has(k)));
-    return canonical(strip(old)) !== canonical(strip(obj));
-}
-
-function references(obj, ids) {
-    if (!ids.size) return false;
-    return Object.entries(obj).some(([key, value]) => key !== 'id' && key !== 'z' && typeof value === 'string' && ids.has(value));
-}
-
-function wireGraph(...flowSets) {
-    const graph = new Map();
-    const link = (a, b) => {
-        if (!graph.has(a)) graph.set(a, new Set());
-        if (!graph.has(b)) graph.set(b, new Set());
-        graph.get(a).add(b);
-        graph.get(b).add(a);
-    };
-    for (const flows of flowSets) {
-        for (const obj of flows) {
-            if (!Array.isArray(obj.wires)) continue;
-            for (const port of obj.wires) {
-                if (Array.isArray(port)) for (const target of port) link(obj.id, target);
-            }
-        }
-    }
-    return graph;
-}
-
-/** Groups the restarting node ids by tab, for a result a person can act on. */
-export function describeScope(flows, scope) {
-    const index = indexFlows(flows);
-    const byTab = new Map();
-    for (const id of scope.nodes) {
-        const obj = index.byId.get(id);
-        const tab = obj?.z && index.byId.get(obj.z);
-        if (!tab || tab.type !== 'tab') continue;
-        if (!byTab.has(tab.id)) byTab.set(tab.id, { flow: tab.id, label: tab.label, nodes: 0 });
-        byTab.get(tab.id).nodes += 1;
-    }
-    return { fullRestart: scope.fullRestart || undefined, restarts: [...byTab.values()] };
+export function describeScope(before, after) {
+    const scope = deployScope(before, after);
+    const order = [...after, ...before].filter((o) => o.type === 'tab').map((o) => o.id);
+    const rank = (id) => (id === 'global' ? Infinity : order.indexOf(id));
+    const label = (id) => (id === 'global' ? 'global config nodes' : labelOf(after.find((o) => o.id === id) ?? before.find((o) => o.id === id)));
+    const restarts = [...scope.flows]
+        .sort(([a], [b]) => rank(a) - rank(b))
+        .map(([flow, ids]) => ({ flow, label: label(flow), nodes: ids.size }));
+    return { fullRestart: scope.fullRestart || undefined, restarts };
 }

@@ -14,6 +14,7 @@ const members = (client, id) => indexFlows(client.state.flows).membersOf(id);
 const byId = (client, id) => client.state.flows.find((o) => o.id === id);
 const tabOrder = (client) => client.state.flows.filter((o) => o.type === 'tab').map((o) => o.id);
 const rejects = (promise, pattern) => assert.rejects(promise, (err) => err instanceof UserError && pattern.test(err.message));
+const refusedFor = (promise, code) => assert.rejects(promise, (err) => err instanceof UserError && err.detail.errors?.some((e) => e.code === code));
 
 describe('update_flow', () => {
     it('deploys the change, keeps order and every tab key, and returns the new etag', async () => {
@@ -43,11 +44,15 @@ describe('update_flow', () => {
         assert.equal((await write(build, { etag: old })).result, 'no_op');
         assert.equal(client.state.deploys, 1);
     });
-    it('refuses a stale etag', async () => {
+    it('refuses a stale etag, without handing out the current one', async () => {
         const { client, write } = setup();
         const old = etag(client, 'A');
         client.externalDeploy((f) => f.map((o) => (o.id === 'A_dbg' ? { ...o, name: 'by a person' } : o)));
-        await rejects(write((f) => plans.updateTab(f, { id: 'A', flow: { info: 'x' } }), { etag: old }), /changed since you read it/);
+        await assert.rejects(write((f) => plans.updateTab(f, { id: 'A', flow: { info: 'x' } }), { etag: old }), (err) => {
+            assert.match(err.message, /changed since you read it/);
+            assert.doesNotMatch(JSON.stringify(err.detail), /[0-9a-f]{16}/);
+            return true;
+        });
     });
     it('retries once on a rev conflict when the target is untouched', async () => {
         const { client, write } = setup();
@@ -73,7 +78,8 @@ describe('update_flow', () => {
         await rejects(write((f) => plans.updateTab(f, { id: 'A', flow: { nodes: [{ id: 'q', type: 'comment', z: 'B' }] } }), { etag: tag }), /belongs to A/);
         await rejects(write((f) => plans.updateTab(f, { id: 'A', flow: { nodes: [...nodes, { id: 'q', type: 'nope' }] } }), { etag: tag }), /introduce/);
         await rejects(write((f) => plans.updateTab(f, { id: 'A', flow: { locked: true } }), { etag: tag }), /cannot change locked/);
-        await rejects(write((f) => plans.updateTab(f, { id: 'A', flow: { env: [{ name: 'S', type: 'cred', value: 'plain' }] } }), { etag: tag }), /credential/);
+        await refusedFor(write((f) => plans.updateTab(f, { id: 'A', flow: { env: [{ name: 'S', type: 'cred', value: 'plain' }] } }), { etag: tag }), 'cred-env');
+        await rejects(write((f) => plans.updateTab(f, { id: 'A', flow: { nodes: [nodes[0], nodes[0]] } }), { etag: tag }), /more than once/);
         assert.equal(client.state.deploys, 0);
     });
     it('points subflows and config nodes to update_global', async () => {
@@ -133,7 +139,7 @@ describe('update_global', () => {
         const { client, write } = setup();
         const node = { ...byId(client, 'px1'), url: 'http://other.invalid' };
         const res = await write((f) => plans.updateGlobal(f, { id: 'px1', node }), { etag: etag(client, 'px1') });
-        assert.deepEqual(res.restarts, [{ flow: 'B', label: 'Tab B', nodes: 2 }]);
+        assert.deepEqual(res.restarts, [{ flow: 'B', label: 'Tab B', nodes: 2 }, { flow: 'global', label: 'global config nodes', nodes: 1 }]);
         await rejects(write((f) => plans.updateGlobal(f, { id: 'px1', node: { ...node, type: 'other' } }), { etag: etag(client, 'px1') }), /keeps its id and type/);
     });
     it('refuses the global-config node, tabs and credentials', async () => {

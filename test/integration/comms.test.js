@@ -1,4 +1,4 @@
-// /comms against a real Node-RED 5.0.4: status and debug capture, buffer bounds under a flood, and
+// /comms against the pinned Node-RED: status and debug capture, buffer bounds under a flood, and
 // recovery when Node-RED restarts or stops answering.
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';

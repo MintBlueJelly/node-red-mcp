@@ -2,14 +2,13 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
     assertOnlyContainerChanged, canonical, describeScope, etagOf, indexFlows, insertTab, removeContainer,
-    replaceContainer, resolveStatus, restartScope, searchNodes, summarize,
+    replaceContainer, resolveStatus, searchNodes, summarize,
 } from '../../src/flows.js';
 import { storedFixture } from '../support/fixture.js';
 
 const ids = (flows) => flows.map((o) => o.id);
 const tabOrder = (flows) => flows.filter((o) => o.type === 'tab').map((o) => o.id);
 const edit = (flows, id, patch) => flows.map((o) => (o.id === id ? { ...o, ...patch } : o));
-const scopeOf = (before, after) => restartScope(before, after).nodes.sort();
 const pick = (r) => ({ node: r.node?.id, tab: r.tab, instance: r.instance, stale: r.stale });
 
 describe('canonical and etag', () => {
@@ -56,35 +55,35 @@ describe('insertTab and removeContainer', () => {
     });
 });
 
-describe('restartScope mirrors Node-RED 5', () => {
+describe('describeScope', () => {
     const flows = storedFixture();
+    const scopeOf = (after) => describeScope(flows, after).restarts.map((r) => [r.flow, r.nodes]);
     it('a changed node restarts itself and everything wired to it, transitively', () => {
-        assert.deepEqual(scopeOf(flows, edit(flows, 'A_dbg', { name: 'x' })), ['A_chain', 'A_dbg', 'A_env', 'A_inj', 'A_j', 'A_lo']);
+        assert.deepEqual(describeScope(flows, edit(flows, 'A_dbg', { name: 'x' })).restarts, [{ flow: 'A', label: 'Tab A', nodes: 6 }]);
     });
-    it('a move restarts nothing', () => {
-        assert.deepEqual(scopeOf(flows, edit(flows, 'A_alone', { x: 999, y: 1 })), []);
+    it('a move, a tab label or a tab description restarts nothing', () => {
+        assert.deepEqual(scopeOf(edit(flows, 'A_alone', { x: 999, y: 1 })), []);
+        assert.deepEqual(scopeOf(edit(flows, 'A', { info: 'x', label: 'y' })), []);
     });
-    it('a tab label or info change restarts nothing; env or disabled restarts the whole tab', () => {
-        assert.deepEqual(scopeOf(flows, edit(flows, 'A', { info: 'x', label: 'y' })), []);
-        assert.equal(scopeOf(flows, edit(flows, 'A', { env: [] })).length, 8);
-        assert.equal(scopeOf(flows, edit(flows, 'D', { disabled: false })).length, 1);
+    it('a tab env change or an enabled tab restarts the whole tab', () => {
+        assert.deepEqual(scopeOf(edit(flows, 'A', { env: [] })), [['A', 7]]);
+        assert.deepEqual(scopeOf(edit(flows, 'D', { disabled: false })), [['D', 1]]);
     });
-    it('a subflow change restarts its instances and what they are wired to', () => {
-        assert.deepEqual(scopeOf(flows, edit(flows, 'sf1fn', { name: 'x' })), ['C_sf']);
-        assert.deepEqual(scopeOf(flows, edit(flows, 'SF1', { info: 'x' })), ['C_sf']);
+    it('a subflow change restarts its instances', () => {
+        assert.deepEqual(scopeOf(edit(flows, 'sf1fn', { name: 'x' })), [['C', 1]]);
+        assert.deepEqual(scopeOf(edit(flows, 'SF1', { info: 'x' })), [['C', 1]]);
     });
-    it('a config node change restarts its users and their wired neighbours', () => {
-        assert.deepEqual(scopeOf(flows, edit(flows, 'px1', { url: 'http://other.invalid' })), ['B_chain', 'B_http', 'px1']);
+    it('a config node change restarts the config node, its users and their wired neighbours', () => {
+        assert.deepEqual(describeScope(flows, edit(flows, 'px1', { url: 'http://other.invalid' })).restarts, [
+            { flow: 'B', label: 'Tab B', nodes: 2 },
+            { flow: 'global', label: 'global config nodes', nodes: 1 },
+        ]);
     });
     it('a group change restarts its members', () => {
-        assert.deepEqual(scopeOf(flows, edit(flows, 'A_grp', { name: 'renamed' })), ['A_alone', 'A_grp']);
+        assert.deepEqual(scopeOf(edit(flows, 'A_grp', { name: 'renamed' })), [['A', 1]]);
     });
     it('a global-config change is a full restart', () => {
-        assert.equal(restartScope(flows, edit(flows, 'gc', { env: [] })).fullRestart, true);
-    });
-    it('describeScope groups by tab', () => {
-        const scope = restartScope(flows, edit(flows, 'A_dbg', { name: 'x' }));
-        assert.deepEqual(describeScope(flows, scope).restarts, [{ flow: 'A', label: 'Tab A', nodes: 6 }]);
+        assert.equal(describeScope(flows, edit(flows, 'gc', { env: [] })).fullRestart, true);
     });
 });
 
@@ -109,9 +108,19 @@ describe('summarize and searchNodes', () => {
     });
     it('resolves statuses and marks leftovers stale', () => {
         const index = indexFlows(flows);
+        assert.deepEqual(pick(resolveStatus(index, 'sf1fn')), { node: 'sf1fn', tab: 'SF1', instance: undefined, stale: true }, 'a definition node never runs as itself');
         assert.deepEqual(pick(resolveStatus(index, 'C_sf-sf1fn')), { node: 'sf1fn', tab: 'C', instance: 'C_sf', stale: false });
         assert.deepEqual(pick(resolveStatus(index, 'D_alone')), { node: 'D_alone', tab: 'D', instance: undefined, stale: true });
         assert.deepEqual(pick(resolveStatus(index, 'deleted')), { node: undefined, tab: undefined, instance: undefined, stale: true });
+    });
+    it('resolves a node inside nested subflow instances to the outer tab', () => {
+        const nested = [
+            ...flows,
+            { id: 'SF0', type: 'subflow', name: 'outer', in: [], out: [] },
+            { id: 'inner_i', type: 'subflow:SF1', z: 'SF0' },
+            { id: 'outer_i', type: 'subflow:SF0', z: 'B' },
+        ];
+        assert.deepEqual(pick(resolveStatus(indexFlows(nested), 'outer_i-inner_i-sf1fn')), { node: 'sf1fn', tab: 'B', instance: 'outer_i/inner_i', stale: false });
     });
     it('finds by function code and caps', () => {
         const r = searchNodes(flows, { query: 'env.get', limit: 10 });

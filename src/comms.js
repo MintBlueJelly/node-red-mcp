@@ -2,8 +2,8 @@
 // node warnings and errors, and runtime notifications. One long-lived connection per process.
 
 const TOPICS = ['status/#', 'debug', 'notification/#'];
-// Node-RED replays retained messages straight after a subscribe; anything inside this window is a
-// replay, so its real time is unknown.
+// Node-RED replays retained messages straight after a subscribe, with no time. The first message for
+// a topic inside this window counts as a replay; a status that really changed in it looks the same.
 const RETAINED_WINDOW_MS = 1000;
 const LEVELS = { 20: 'error', 30: 'warn' };
 

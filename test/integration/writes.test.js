@@ -1,4 +1,4 @@
-// The write path against a real Node-RED 5.0.4: what restarts, what survives, and what is refused.
+// The write path against the pinned Node-RED: what restarts, what survives, and what is refused.
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import { connect } from '../support/mcp-client.js';
@@ -21,14 +21,7 @@ after(async () => {
     await nr?.cleanup();
 });
 
-/** Runs `action` and returns which On Start counters moved. */
-async function restartedBy(action) {
-    const before = await nr.counters();
-    const result = await action();
-    await sleep(800);
-    const after = await nr.counters();
-    return { result, moved: Object.keys(after).filter((k) => after[k] !== before[k]).sort() };
-}
+const restartedBy = (action) => nr.restartedBy(action);
 const tabOrder = async () => (await nr.api('GET', '/flows')).body.flows.filter((o) => o.type === 'tab').map((o) => o.id);
 const stored = async (id) => (await nr.api('GET', '/flows')).body.flows.find((o) => o.id === id);
 const readSecret = async () => {
@@ -71,6 +64,7 @@ describe('update_flow', () => {
         const res = await mcp.call('update_flow', { id: 'A', etag: flow.etag, flow: { info: 'mine' } });
         assert.equal(res.isError, true);
         assert.match(res.error, /changed since you read it/);
+        assert.doesNotMatch(JSON.stringify(res), /[0-9a-f]{16}/, 'the refusal hands out no etag');
         assert.equal((await stored('A_dbg')).name, 'by a person');
     });
 
@@ -86,6 +80,23 @@ describe('update_flow', () => {
         const res = await mcp.call('update_flow', { id: 'B', etag: flow.etag, flow: { nodes: [...flow.nodes, { id: 'ghost', type: 'no-such-node', x: 1, y: 1, wires: [] }] } });
         assert.equal(res.isError, true);
         assert.equal(res.errors[0].code, 'unknown-type');
+        assert.deepEqual((await nr.api('GET', '/flows/state')).body, { state: 'start' });
+    });
+
+    it('refuses writes that would stop or hang Node-RED, and it keeps running', async () => {
+        const flow = await mcp.call('get_flow', { id: 'B' });
+        const cases = [
+            ['group-cycle', { id: 'loop', type: 'group', z: 'B', g: 'loop', name: 'g', style: {}, nodes: [], x: 10, y: 10, w: 50, h: 50 }],
+            ['external-modules', { id: 'withlib', type: 'function', z: 'B', name: 'lib', func: 'return msg;', outputs: 1, libs: [{ var: 'x', module: 'no-such-package' }], x: 1, y: 1, wires: [[]] }],
+            ['exec', { id: 'shell', type: 'exec', z: 'B', command: 'true', addpay: '', append: '', useSpawn: 'false', timer: '', winHide: false, oldrc: false, name: '', x: 1, y: 1, wires: [[], [], []] }],
+        ];
+        for (const [code, node] of cases) {
+            const res = await mcp.call('update_flow', { id: 'B', etag: flow.etag, flow: { nodes: [...flow.nodes, node] } });
+            assert.deepEqual(res.errors?.map((e) => e.code), [code], code);
+        }
+        const sf = await mcp.call('get_flow', { id: 'SF1' });
+        const cycle = await mcp.call('update_global', { id: 'SF1', etag: sf.etag, nodes: [...sf.nodes, { id: 'self', type: 'subflow:SF1', x: 300, y: 50, wires: [] }] });
+        assert.deepEqual(cycle.errors?.map((e) => e.code), ['subflow-cycle']);
         assert.deepEqual((await nr.api('GET', '/flows/state')).body, { state: 'start' });
     });
 
@@ -109,6 +120,21 @@ describe('create_flow and delete_flow', () => {
         assert.equal((await mcp.call('delete_flow', { id: created.flow, etag })).result, 'already_deleted');
     });
 
+    it('triggers an inject node once when called twice at once, and refuses other nodes', async () => {
+        const created = await mcp.call('create_flow', { flow: { label: 'Inject twice', nodes: [
+            { id: 'tw_inj', type: 'inject', props: [{ p: 'payload' }], repeat: '', once: false, payload: '', payloadType: 'date', x: 100, y: 100, wires: [['tw_fn']] },
+            { id: 'tw_fn', type: 'function', name: 'count', func: "global.set('tw_hits', (global.get('tw_hits') || 0) + 1); return msg;", outputs: 1, x: 300, y: 100, wires: [[]] },
+        ] } });
+        const pair = await Promise.all([mcp.call('trigger_inject', { node_id: 'tw_inj' }), mcp.call('trigger_inject', { node_id: 'tw_inj' })]);
+        assert.deepEqual(pair.map((r) => Boolean(r.triggered)).sort(), [false, true]);
+        await sleep(300);
+        assert.equal(await nr.context('tw_hits'), '1');
+        assert.match((await mcp.call('trigger_inject', { node_id: 'tw_fn' })).error, /a function, not an inject node/);
+        const { etag } = await mcp.call('get_flow', { id: created.flow });
+        const disabled = await mcp.call('update_flow', { id: created.flow, etag, flow: { disabled: true } });
+        await mcp.call('delete_flow', { id: created.flow, etag: disabled.etag });
+    });
+
     it('will not delete a running flow', async () => {
         const { etag } = await mcp.call('get_flow', { id: 'C' });
         assert.match((await mcp.call('delete_flow', { id: 'C', etag })).error, /disable it/);
@@ -127,7 +153,7 @@ describe('update_global', () => {
     it('a config node change restarts its users, and keeps its credentials', async () => {
         const px = await mcp.call('get_flow', { id: 'px1' });
         const { result, moved } = await restartedBy(() => mcp.call('update_global', { id: 'px1', etag: px.etag, node: { ...px.node, url: 'http://proxy2.invalid:3128' } }));
-        assert.deepEqual(result.restarts, [{ flow: 'B', label: 'Tab B', nodes: 2 }]);
+        assert.deepEqual(result.restarts, [{ flow: 'B', label: 'Tab B', nodes: 2 }, { flow: 'global', label: 'global config nodes', nodes: 1 }]);
         assert.deepEqual(moved, ['B_chain']);
         assert.deepEqual((await nr.api('GET', '/credentials/http-proxy/px1')).body, { username: 'u', has_password: true });
     });

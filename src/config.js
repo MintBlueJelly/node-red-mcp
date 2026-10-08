@@ -18,8 +18,9 @@ export function loadConfig(env = process.env) {
     return {
         nodeRedUrl: nodeRedUrl.replace(/\/+$/, ''),
         nodeRedToken: env.NODE_RED_TOKEN || undefined,
-        host: env.HOST || '0.0.0.0',
-        port: int(env, 'PORT', 8080),
+        // MCP_PORT and MCP_HOST, as some MCP hosts set them, apply where PORT and HOST are unset.
+        host: env.HOST || env.MCP_HOST || '0.0.0.0',
+        port: int(env, 'PORT', int(env, 'MCP_PORT', 8080)),
         requestTimeoutMs: int(env, 'NODE_RED_TIMEOUT_MS', 30000),
         heartbeatTimeoutMs: int(env, 'COMMS_HEARTBEAT_TIMEOUT_MS', 45000),
         debugBufferItems: int(env, 'DEBUG_BUFFER_ITEMS', 1000),

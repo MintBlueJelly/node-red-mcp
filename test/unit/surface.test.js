@@ -23,6 +23,10 @@ describe('loadConfig', () => {
         assert.throws(() => loadConfig({ NODE_RED_URL: 'nodered:1880x' }), /not an http\(s\) URL/);
         assert.throws(() => loadConfig({ NODE_RED_URL: 'http://n:1880', PORT: '80a' }), /PORT must be an integer/);
     });
+    it('takes the port from MCP_PORT when PORT is unset', () => {
+        assert.equal(loadConfig({ NODE_RED_URL: 'http://n:1880', MCP_PORT: '9090' }).port, 9090);
+        assert.equal(loadConfig({ NODE_RED_URL: 'http://n:1880', MCP_PORT: '9090', PORT: '7070' }).port, 7070);
+    });
     it('defaults', () => {
         const c = loadConfig({ NODE_RED_URL: 'http://n:1880/' });
         assert.equal(c.nodeRedUrl, 'http://n:1880');

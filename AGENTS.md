@@ -22,18 +22,24 @@ These cause real harm if violated. Everything else is a preference.
   deploy, or a second way to deploy. Each one loses a guarantee the README lists.
 - **What is not implemented stays unimplemented.** Deployments rely on there being no tool that
   installs, removes or enables node modules, starts or stops the runtime, deletes context, writes
-  credentials, or deploys in full. `test/unit/surface.test.js` checks the names; the review checks
-  the substance.
+  credentials, or deploys in full, and on flow writes refusing `libs` and `exec` nodes, which
+  would install modules or run shell commands. `test/unit/surface.test.js` checks the names; the
+  review checks the substance.
+- **A refusal never carries an etag**, and neither does a `get_flow` too large to return whole. A
+  client given one resends its stale or partial node list with it, and the write deletes what it
+  left out.
 - **Tool names are an interface.** Deployments allowlist them by name, and an allowlist silently
   withholds a renamed tool. `test/tools.snapshot.txt` fails on any change. A rename or a new tool
   is a version bump and a note to the deployment repository.
 - **Every input schema rejects unknown keys.** `server.js` wraps each tool's input in
   `z.strictObject`, and nested objects use `z.strictObject` too. A default `z.object` strips an
   unknown key, so a misspelt optional argument on a write turns into a silent `no_op`.
-- **A restart-scope claim needs a measurement.** `restartScope` in `src/flows.js` mirrors Node-RED's
-  `diffConfigs`, and `test/integration/writes.test.js` is the evidence that it matches. After
-  bumping the `node-red` devDependency, run the integration tests before believing anything in the
-  README about what restarts.
+- **What restarts is Node-RED's answer, not ours.** `src/diff.js` follows Node-RED's `diffConfigs`
+  step by step; keep its plain-object lookups, because Node-RED's results depend on how they coerce
+  ids. `test/unit/diff.test.js` requires the same answer as the `diffConfigs` of the pinned
+  devDependency for every generated change, and `test/integration/scope.test.js` measures the
+  result with counters. A restart-scope claim needs both. When the `node-red` devDependency moves,
+  which it does only with the deployed runtime, both run against the new version.
 
 ## Layout
 
@@ -43,15 +49,16 @@ src/config.js     environment parsing; refuses what does not parse
 src/server.js     stateless Streamable HTTP, /healthz, tool registration
 src/tools.js      the 17 tools
 src/writer.js     the write path and the plans for each kind of change
-src/flows.js      pure functions over the flat flow array, including restartScope
+src/flows.js      pure functions over the flat flow array, status resolution, describeScope
+src/diff.js       what a modified-flows deploy restarts, the way Node-RED computes it
 src/validate.js   structural validation; refuses only what a change introduces
 src/comms.js      the /comms client: statuses, debug, runtime events, reconnect
 src/ring.js       the bounded debug buffer and its cursor
 src/nodered.js    Admin API client
 src/output.js     result formatting, caps, errors
-test/unit/        no Node-RED needed
+test/unit/        no running Node-RED; diff.test.js loads its diffConfigs from the devDependency
 test/integration/ spawns the pinned Node-RED and the server as child processes
-test/support/     fixture, fake Admin API, harness, MCP client
+test/support/     fixtures, fake Admin API, harness, MCP client
 ```
 
 ## Commands
@@ -59,10 +66,12 @@ test/support/     fixture, fake Admin API, harness, MCP client
 ```sh
 npm ci
 npm test
-npm run test:integration    # ~30 s; the SIGSTOP test is skipped on Windows and runs in CI
+npm run test:integration    # about a minute; the SIGSTOP test is skipped on Windows and runs in CI
 ```
 
 ## Releasing
 
-Bump `version` in `package.json` and push. CI publishes only a version without a GitHub release,
-and the release notes carry the digest the deployment repository pins.
+Bump `version` in `package.json` and push to `main`. CI publishes only from `main`, only a version
+without a GitHub release and without an image, and the release notes carry the digest the deployment
+repository pins. Actions and the base image are pinned by digest; `.github/dependabot.yml` proposes
+moving them.
