@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
     assertOnlyContainerChanged, canonical, describeScope, etagOf, indexFlows, insertTab, removeContainer,
-    replaceContainer, restartScope, searchNodes, summarize,
+    replaceContainer, resolveStatus, restartScope, searchNodes, summarize,
 } from '../../src/flows.js';
 import { storedFixture } from '../support/fixture.js';
 
@@ -10,6 +10,7 @@ const ids = (flows) => flows.map((o) => o.id);
 const tabOrder = (flows) => flows.filter((o) => o.type === 'tab').map((o) => o.id);
 const edit = (flows, id, patch) => flows.map((o) => (o.id === id ? { ...o, ...patch } : o));
 const scopeOf = (before, after) => restartScope(before, after).nodes.sort();
+const pick = (r) => ({ node: r.node?.id, tab: r.tab, instance: r.instance, stale: r.stale });
 
 describe('canonical and etag', () => {
     it('ignores key order', () => {
@@ -90,13 +91,27 @@ describe('restartScope mirrors Node-RED 5', () => {
 describe('summarize and searchNodes', () => {
     const flows = storedFixture();
     it('lists tabs in order with counts and problems', () => {
-        const s = summarize(flows, new Map([['A_env', { fill: 'red' }], ['B_http', { fill: 'green' }]]));
+        const s = summarize(flows, new Map([
+            ['A_env', { fill: 'red' }],
+            ['B_http', { fill: 'green' }],
+            ['C_sf-sf1fn', { fill: 'yellow' }],
+            ['D_alone', { fill: 'red' }],
+            ['deleted', { fill: 'red' }],
+        ]));
         assert.deepEqual(s.tabs.map((t) => t.id), ['A', 'B', 'C', 'D', 'E']);
         assert.equal(s.tabs[0].problems, 1);
         assert.equal(s.tabs[1].problems, undefined);
+        assert.equal(s.tabs[2].problems, 1, 'a node inside a subflow instance counts for its tab');
+        assert.equal(s.tabs[3].problems, undefined, 'a disabled tab has only leftovers');
         assert.equal(s.tabs[3].disabled, true);
         assert.equal(s.tabs[4].locked, true);
         assert.deepEqual(s.subflows, [{ id: 'SF1', name: 'Sub 1', nodes: 1, instances: 1, info: undefined }]);
+    });
+    it('resolves statuses and marks leftovers stale', () => {
+        const index = indexFlows(flows);
+        assert.deepEqual(pick(resolveStatus(index, 'C_sf-sf1fn')), { node: 'sf1fn', tab: 'C', instance: 'C_sf', stale: false });
+        assert.deepEqual(pick(resolveStatus(index, 'D_alone')), { node: 'D_alone', tab: 'D', instance: undefined, stale: true });
+        assert.deepEqual(pick(resolveStatus(index, 'deleted')), { node: undefined, tab: undefined, instance: undefined, stale: true });
     });
     it('finds by function code and caps', () => {
         const r = searchNodes(flows, { query: 'env.get', limit: 10 });

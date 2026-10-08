@@ -26,8 +26,8 @@ after(async () => {
 
 describe('status and debug output', () => {
     it('replays the statuses that were set before the server connected', async () => {
-        const res = await mcp.call('get_node_status', { flow_id: 'A' });
-        const probe = res.statuses.find((s) => s.id === 'A_env');
+        // The replay lands a few milliseconds after the subscribe that marks the server connected.
+        const probe = await waitFor(async () => (await mcp.call('get_node_status', { flow_id: 'A' })).statuses.find((s) => s.id === 'A_env'), { what: 'the replay', timeoutMs: 5000 });
         assert.deepEqual({ fill: probe.fill, text: probe.text, retained: probe.retained }, { fill: 'red', text: 'probed', retained: true });
     });
 
