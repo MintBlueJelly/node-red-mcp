@@ -76,13 +76,44 @@ function firstLine(text, max = 120) {
 }
 
 /**
- * The compact listing `list_flows` returns. `problems` counts nodes whose current status is red or
- * yellow — the cheapest signal of where to look first.
+ * Resolves a status id to its node and tab, including the `<instance>-<node>` ids of nodes inside a
+ * subflow instance. `stale` marks what Node-RED still replays but no running node can have set: the
+ * status of a deleted node, or of a node in a disabled tab.
+ */
+export function resolveStatus(index, id) {
+    let node = index.byId.get(id);
+    let tab = node?.z;
+    let instance;
+    if (!node) {
+        for (let i = id.indexOf('-'); i > 0; i = id.indexOf('-', i + 1)) {
+            const candidate = index.byId.get(id.slice(0, i));
+            if (candidate?.type?.startsWith('subflow:')) {
+                instance = candidate.id;
+                tab = candidate.z;
+                node = index.byId.get(id.slice(i + 1));
+                break;
+            }
+        }
+    }
+    const container = tab ? index.byId.get(tab) : undefined;
+    return { node, tab, instance, unknownNode: !node, flowDisabled: Boolean(container?.disabled), stale: !node || Boolean(container?.disabled) };
+}
+
+export const isProblem = (status) => ['red', 'yellow'].includes(status?.fill);
+
+/**
+ * The compact listing `list_flows` returns. `problems` counts the nodes of a running tab, inside its
+ * subflow instances too, whose current status is red or yellow — the cheapest signal of where to
+ * look first.
  */
 export function summarize(flows, statuses = new Map()) {
     const index = indexFlows(flows);
-    const problemsIn = (id) => index.membersOf(id)
-        .filter((n) => ['red', 'yellow'].includes(statuses.get(n.id)?.fill)).length;
+    const problems = new Map();
+    for (const [id, status] of statuses) {
+        const r = resolveStatus(index, id);
+        if (!r.stale && isProblem(status)) problems.set(r.tab, (problems.get(r.tab) ?? 0) + 1);
+    }
+    const problemsIn = (id) => problems.get(id) ?? 0;
     const instancesOf = (sfId) => flows.filter((n) => n.type === `subflow:${sfId}`).length;
     return {
         tabs: index.tabs.map((t) => ({

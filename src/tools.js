@@ -1,7 +1,7 @@
 // The tool surface. What is absent is deliberate: installing, removing or enabling npm modules,
 // starting or stopping the runtime, deleting context and full deploys are not implemented at all.
 import { z } from 'zod';
-import { containerObjects, etagOf, indexFlows, labelOf, searchNodes, summarize } from './flows.js';
+import { containerObjects, etagOf, indexFlows, isProblem, labelOf, resolveStatus, searchNodes, summarize } from './flows.js';
 import { UserError } from './output.js';
 import { check, plans } from './writer.js';
 
@@ -20,20 +20,6 @@ const iso = (t) => (t ? new Date(t).toISOString() : undefined);
 
 function flowLabel(index, id) {
     return labelOf(index.byId.get(id));
-}
-
-/** Resolves a status id, including the `<instance>-<node>` ids of nodes inside a subflow instance. */
-function resolveNode(index, id) {
-    const direct = index.byId.get(id);
-    if (direct) return { node: direct, tab: direct.z };
-    for (let i = id.indexOf('-'); i > 0; i = id.indexOf('-', i + 1)) {
-        const instance = index.byId.get(id.slice(0, i));
-        if (instance?.type?.startsWith('subflow:')) {
-            const inner = index.byId.get(id.slice(i + 1));
-            return { node: inner, tab: instance.z, instance: instance.id };
-        }
-    }
-    return { tab: undefined };
 }
 
 export function defineTools() {
@@ -88,22 +74,22 @@ export function defineTools() {
         },
         {
             name: 'get_node_status',
-            description: 'Current status of Node-RED nodes — the coloured dot and text the editor shows under a node (e.g. "connected", "ENOTFOUND"). Filter by flow or node, or only red and yellow ones. Statuses replayed at connect are marked retained; ones older than the last deploy are marked beforeLastDeploy.',
+            description: 'Current status of Node-RED nodes — the coloured dot and text the editor shows under a node (e.g. "connected", "ENOTFOUND"). Filter by flow or node, or only red and yellow ones. Statuses replayed at connect are marked retained, ones older than the last deploy beforeLastDeploy, and leftovers from deleted nodes or disabled flows stale — only_problems leaves those out.',
             annotations: READ,
             input: {
                 flow_id: z.string().optional(),
                 node_id: z.string().optional(),
-                only_problems: z.boolean().default(false).describe('Only red and yellow statuses'),
+                only_problems: z.boolean().default(false).describe('Only red and yellow statuses of running nodes'),
             },
             async handler({ flow_id: flowId, node_id: nodeId, only_problems: onlyProblems }, { client, comms }) {
                 const { flows } = await client.getFlows();
                 const index = indexFlows(flows);
                 const statuses = [];
                 for (const [id, s] of comms.statuses) {
-                    const r = resolveNode(index, id);
+                    const r = resolveStatus(index, id);
                     if (flowId && r.tab !== flowId) continue;
                     if (nodeId && id !== nodeId && r.node?.id !== nodeId && r.instance !== nodeId) continue;
-                    if (onlyProblems && !['red', 'yellow'].includes(s.fill)) continue;
+                    if (onlyProblems && (!isProblem(s) || r.stale)) continue;
                     statuses.push({
                         id,
                         name: labelOf(r.node) || undefined,
@@ -111,7 +97,9 @@ export function defineTools() {
                         flow: r.tab,
                         flowLabel: flowLabel(index, r.tab),
                         subflowInstance: r.instance,
-                        unknownNode: r.node ? undefined : true,
+                        unknownNode: r.unknownNode || undefined,
+                        flowDisabled: r.flowDisabled || undefined,
+                        stale: r.stale || undefined,
                         fill: s.fill,
                         shape: s.shape,
                         text: s.text,

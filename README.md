@@ -106,6 +106,10 @@ A long-lived WebSocket subscribes to `status/#`, `debug` and `notification/#`.
 
 - **Statuses.** Node-RED replays the current statuses on subscribe without a time, so they are
   marked `retained`. A status older than the last deploy is marked `beforeLastDeploy`.
+- **Leftovers.** Node-RED can go on replaying the last status of a deleted node, or of a node in a
+  disabled flow that set it while stopping. Those are marked `stale`, and neither `only_problems`
+  nor the `problems` count of `list_flows` includes them. That count does include nodes inside
+  subflow instances on the tab.
 - **Subflow instances.** Nodes inside a subflow instance report as `<instance>-<node>` and are
   attributed to the instance's tab.
 - **Debug output** goes into a ring bounded by count and bytes, because Node-RED publishes it

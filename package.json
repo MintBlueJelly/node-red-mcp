@@ -1,7 +1,7 @@
 {
   "name": "node-red-mcp",
   "description": "MCP server for authoring and troubleshooting Node-RED flows over the Admin API and the editor WebSocket",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "license": "MIT",
   "private": true,
   "type": "module",
